@@ -50,6 +50,8 @@ static const char pkgname[] = "darkgopherd/0.0.from.git",
 #define MAX_CONNECTIONS 64
 #define MAX_REQUEST_LENGTH 1024
 
+static const size_t max_size_t = ~((size_t)0);
+
 struct connection {
     int socket;
     struct sockaddr_in client;
@@ -71,11 +73,12 @@ struct connection {
 
 static volatile int running = 0; /* Set by signal handler. */
 static int listen_fd = -1;
-static uint16_t port = 7070;  // TODO: Make this configurable.
+static uint16_t port = 7070; /* TODO: Make this configurable. */
 static char *fqdn = NULL;
 static struct connection **connections;
 static int num_conn = 0;
 static uint64_t num_requests = 0, total_in = 0, total_out = 0;
+static char *gopher_root = NULL; /* TODO: Make this configurable. */
 
 /* close() that dies on error. */
 static void xclose(const int fd) {
@@ -191,6 +194,7 @@ static void accept_connection() {
     conn->request = NULL;
     conn->request_length = 0;
     conn->reply = NULL;
+    conn->reply_sent = 0;
     conn->reply_fd = -1;
 
     assert(num_conn < MAX_CONNECTIONS);
@@ -212,21 +216,63 @@ static void log_connection(const struct connection *conn) {
 /* Destructor for connection. */
 static void finish_connection(struct connection *conn) {
     log_connection(conn);
+    num_requests++;
     xclose(conn->socket);
     assert(conn->state == FINISHED);
     free(conn->request);
     if (conn->reply) free(conn->reply);
+    if (conn->reply_fd != -1) xclose(conn->reply_fd);
     free(conn);
 }
 
+/* Return 0 if the request (as a path) is unsafe (contains /../). */
+static int is_request_safe(const char *req, int len) {
+    if (req[0] != '/') return 0;
+    // Unsafe if it contains ..
+    if (strstr(req, "/../") != NULL) return 0;
+    // Or ends with it.
+    if (memcmp(req + len - 3, "/..", 3) == 0) return 0;
+    return 1;
+}
+
 static void process_request(struct connection *conn) {
-    // TODO: Actually serve requests.
-    conn->reply = strdup("iHello, world\tfake\t(NULL)\t0\n");
-    conn->reply_type = REPLY_GENERATED;
-    conn->reply_length = strlen(conn->reply);
-    conn->reply_sent = 0;
+    char *path;
+
+    /* Serving the index. */
+    if (conn->request_length == 0) {
+        /* TODO: actually generate index. */
+        conn->reply = strdup("iHello, world\tfake\t(NULL)\t0\n");
+        conn->reply_type = REPLY_GENERATED;
+        conn->reply_length = strlen(conn->reply);
+        conn->state = SEND_REPLY;
+        return;
+    }
+
+    /* Serving a path: check if it's safe. */
+    if (!is_request_safe(conn->request, conn->request_length)) {
+        conn->state = FINISHED;
+        return;
+    }
+
+    /* Make a path using gopher_root. */
+    path = malloc(strlen(gopher_root) + 1 + conn->request_length + 1);
+    path[0] = 0;
+    strcat(path, gopher_root);
+    strcat(path, "/");
+    strcat(path, conn->request);
+
+    /* Open the file. */
+    conn->reply_fd = open(path, O_RDONLY | O_NONBLOCK);
+    free(path);
+    if (conn->reply_fd == -1) {
+        conn->reply = strdup("3File not found.\terror.host\t1\n");
+        conn->reply_type = REPLY_GENERATED;
+        conn->reply_length = strlen(conn->reply);
+        conn->state = SEND_REPLY;
+        return;
+    }
+    conn->reply_type = REPLY_FROMFILE;
     conn->state = SEND_REPLY;
-    num_requests++;
 }
 
 /* Remove \r\n or \n suffix. */
@@ -277,19 +323,30 @@ static void recv_request(struct connection *conn) {
 }
 
 static void send_reply(struct connection *conn) {
-    ssize_t sent;
-    /* off_t can be wider than size_t, avoid overflow in send_len. */
-    const size_t max_size_t = ~((size_t)0);
-    off_t send_len = conn->reply_length - conn->reply_sent;
-    if (send_len > max_size_t) send_len = max_size_t;
+    ssize_t sent = 0, numread;
+    char buf[1 << 15];
+    off_t send_len;
 
     assert(conn->state == SEND_REPLY);
-    if (conn->reply_type == REPLY_GENERATED) {
-        sent = send(conn->socket, conn->reply + conn->reply_sent,
-                    (size_t)send_len, 0);
-    } else {
-        // TODO
-        return;
+    switch (conn->reply_type) {
+        case REPLY_GENERATED:
+            /* off_t can be wider than size_t, avoid overflow in send_len. */
+            send_len = conn->reply_length - conn->reply_sent;
+            if (send_len > max_size_t) send_len = max_size_t;
+            sent = send(conn->socket, conn->reply + conn->reply_sent,
+                        (size_t)send_len, 0);
+            break;
+
+        case REPLY_FROMFILE:
+            numread = read(conn->reply_fd, buf, sizeof(buf));
+            if (numread <= 0) {
+                if (numread == -1) warn("read(fd=%d)", conn->reply_fd);
+                /* EOF or read error. */
+                conn->state = FINISHED;
+                return;
+            }
+            sent = send(conn->socket, buf, numread, /*flags=*/0);
+            break;
     }
     // conn->last_active = now;
 
@@ -387,6 +444,13 @@ static void serve() {
 }
 
 int main(int argc, char **argv) {
+    assert(is_request_safe("/blah", 5));
+    assert(is_request_safe("/", 1));
+    assert(is_request_safe("/.", 2));
+    assert(!is_request_safe("/..", 3));
+    assert(!is_request_safe("/../", 4));
+    gopher_root = "docs"; /* FIXME */
+
     printf("%s, %s.\n", pkgname, copyright);
 
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) err(1, "signal(ignore SIGPIPE)");
@@ -403,5 +467,7 @@ int main(int argc, char **argv) {
     xclose(listen_fd);
     free(connections);
     free(fqdn);
+    printf("Requests: %llu\n", llu(num_requests));
+    printf("Bytes: %llu in, %llu out\n", llu(total_in), llu(total_out));
     return 0;
 }
