@@ -19,27 +19,38 @@
 static const char pkgname[] = "darkgopherd/0.0.from.git",
                   copyright[] = "copyright (c) 2024 Emil Mikulic";
 
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>   // inet_ntoa
 #include <assert.h>      // assert
+#include <dirent.h>      // opendir
 #include <err.h>         // err
 #include <errno.h>       // errno
 #include <fcntl.h>       // fcntl
 #include <netinet/in.h>  // sockaddr_in
 #include <signal.h>      // signal
+#include <stdarg.h>      // va_start
 #include <stdint.h>      // uint16_t
 #include <stdio.h>       // printf
 #include <stdlib.h>      // free
 #include <string.h>      // strdup
 #include <sys/select.h>  // select
 #include <sys/socket.h>  // socket
+#include <sys/stat.h>    // stat
 #include <time.h>        // time
 #include <unistd.h>      // close
 
 #if defined(__GNUC__)
 #define unused __attribute__((__unused__))
+/* Borrowed from FreeBSD's src/sys/sys/cdefs.h,v 1.102.2.2.2.1 */
+#define __printflike(fmtarg, firstvararg) \
+    __attribute__((__format__(__printf__, fmtarg, firstvararg)))
 #else
 #define unused
+#define __printflike(fmtarg, firstvararg)
 #endif
+
+#define llu(x) ((unsigned long long)(x))
 
 #ifndef HOST_NAME_MAX
 #define HOST_NAME_MAX 64
@@ -99,6 +110,84 @@ static void *xrealloc(void *original, const size_t size) {
     return ptr;
 }
 
+/* strdup() that dies if it can't allocate. */
+static char *xstrdup(const char *src) {
+    char *out = strdup(src);
+    if (out == NULL) errx(1, "can't strdup, out of memory");
+    return out;
+}
+
+/* vasprintf() that dies if it fails. */
+static unsigned int __printflike(2, 0)
+    xvasprintf(char **ret, const char *format, va_list ap) {
+    int len = vasprintf(ret, format, ap);
+    if (ret == NULL || len == -1) errx(1, "out of memory in vasprintf()");
+    return (unsigned int)len;
+}
+
+/* asprintf() that dies if it fails. */
+static unsigned int __printflike(2, 3)
+    xasprintf(char **ret, const char *format, ...) {
+    va_list va;
+    unsigned int len;
+
+    va_start(va, format);
+    len = xvasprintf(ret, format, va);
+    va_end(va);
+    return len;
+}
+
+/* Append buffer code. A somewhat efficient string buffer with pool-based
+ * reallocation. */
+#define APBUF_INIT 4096
+#define APBUF_GROW APBUF_INIT
+struct apbuf {
+    size_t length, pool;
+    char *str;
+};
+
+static struct apbuf *make_apbuf(void) {
+    struct apbuf *buf = xmalloc(sizeof(struct apbuf));
+    buf->length = 0;
+    buf->pool = APBUF_INIT;
+    buf->str = xmalloc(buf->pool);
+    return buf;
+}
+
+/* Append s (of length len) to buf. */
+static void appendl(struct apbuf *buf, const char *s, const size_t len) {
+    size_t need = buf->length + len;
+    if (buf->pool < need) {
+        /* pool has dried up */
+        while (buf->pool < need) buf->pool += APBUF_GROW;
+        buf->str = xrealloc(buf->str, buf->pool);
+    }
+    memcpy(buf->str + buf->length, s, len);
+    buf->length += len;
+}
+
+#ifdef __GNUC__
+#define append(buf, s) \
+    appendl(buf, s, (__builtin_constant_p(s) ? sizeof(s) - 1 : strlen(s)))
+#else
+static void append(struct apbuf *buf, const char *s) {
+    appendl(buf, s, strlen(s));
+}
+#endif
+
+static void __printflike(2, 3)
+    appendf(struct apbuf *buf, const char *format, ...) {
+    char *tmp;
+    va_list va;
+    size_t len;
+
+    va_start(va, format);
+    len = xvasprintf(&tmp, format, va);
+    va_end(va);
+    appendl(buf, tmp, len);
+    free(tmp);
+}
+
 /* Signal handler for SIGTERM etc. */
 static void stop_running(int sig unused) { running = 0; }
 
@@ -106,14 +195,15 @@ static void stop_running(int sig unused) { running = 0; }
 static char *get_fqdn() {
     char hostname[HOST_NAME_MAX + 1];
     char domainname[DOMAIN_NAME_MAX + 1];
-    char fqdn[HOST_NAME_MAX + DOMAIN_NAME_MAX + 3];
+    char *fqdn;
 
     if (gethostname(hostname, HOST_NAME_MAX) == -1) err(1, "gethostname()");
     if (getdomainname(domainname, DOMAIN_NAME_MAX) == -1)
         err(1, "getdomainname()");
-    if (domainname[0] == '(') return strdup(hostname);
-    snprintf(fqdn, sizeof(fqdn) - 1, "%s.%s", hostname, domainname);
-    return strdup(fqdn);
+    /* Missing domainname. */
+    if (domainname[0] == '(') return xstrdup(hostname);
+    xasprintf(&fqdn, "%s.%s", hostname, domainname);
+    return fqdn;
 }
 
 /* Format [when] as a CLF date format, stored in the specified buffer. The same
@@ -204,7 +294,6 @@ static void accept_connection() {
 static void log_connection(const struct connection *conn) {
     char dest[CLF_DATE_LEN];
     time_t now = time(NULL);
-#define llu(x) ((unsigned long long)(x))
 
     printf("%s - - %s \"%s\" %llu\n", inet_ntoa(conn->client.sin_addr),
            clf_date(dest, now),
@@ -225,28 +314,141 @@ static void finish_connection(struct connection *conn) {
     free(conn);
 }
 
-/* Return 0 if the request (as a path) is unsafe (contains /../). */
+/* Return 0 if the request (as a path) is unsafe (contains /../) */
 static int is_request_safe(const char *req, int len) {
+    if (len == 0) return 1;
     if (req[0] != '/') return 0;
-    // Unsafe if it contains ..
+    /* Unsafe if it contains ".." */
     if (strstr(req, "/../") != NULL) return 0;
-    // Or ends with it.
+    /* Or ends with it. */
     if (memcmp(req + len - 3, "/..", 3) == 0) return 0;
+    /* Or contains a NUL. */
+    for (int i = 0; i < len; i++) {
+        if (req[i] == '\0') return 0;
+    }
     return 1;
+}
+
+/* Make the reply an error message. */
+static void error_reply(struct connection *conn, const char *msg) {
+    xasprintf(&conn->reply, "3%s\terror.host\t1\n", msg);
+    conn->reply_type = REPLY_GENERATED;
+    conn->reply_length = strlen(conn->reply);
+    conn->state = SEND_REPLY;
+}
+
+struct dlent {
+    char *name; /* The name/path of the entry. */
+    int is_dir; /* If the entry is a directory and not a file. */
+};
+
+static int dlent_cmp(const void *a, const void *b) {
+    if (strcmp((*((const struct dlent *const *)a))->name, "..") == 0) {
+        return -1; /* Special-case ".." to come first. */
+    }
+    return strcmp((*((const struct dlent *const *)a))->name,
+                  (*((const struct dlent *const *)b))->name);
+}
+
+/* Make sorted list of files in a directory. Returns number of entries, or -1
+ * if error occurs. */
+static ssize_t make_sorted_dirlist(const char *path, struct dlent ***output) {
+    DIR *dir;
+    struct dirent *ent;
+    size_t entries = 0;
+    size_t pool = 128;
+    char *currname;
+    struct dlent **list = NULL;
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        warn("opendir(\"%s\")", path);
+        return -1;
+    }
+
+    currname = xmalloc(strlen(path) + MAXNAMLEN + 1);
+    list = xmalloc(sizeof(struct dlent *) * pool);
+
+    while ((ent = readdir(dir)) != NULL) {
+        struct stat s;
+
+        /* Skip. */
+        if (strcmp(ent->d_name, ".") == 0) continue;
+        if (strcmp(ent->d_name, "..") == 0) continue;
+        assert(strlen(ent->d_name) <= MAXNAMLEN);
+        sprintf(currname, "%s/%s", path, ent->d_name);
+        if (stat(currname, &s) == -1) continue; /* Skip un-stat-able files. */
+        if (entries == pool) {
+            pool *= 2;
+            list = xrealloc(list, sizeof(struct dlent *) * pool);
+        }
+        list[entries] = xmalloc(sizeof(struct dlent));
+        list[entries]->name = xstrdup(ent->d_name);
+        list[entries]->is_dir = S_ISDIR(s.st_mode);
+        entries++;
+    }
+    closedir(dir);
+    free(currname);
+    qsort(list, entries, sizeof(struct dlent *), dlent_cmp);
+    *output = list;
+    return (ssize_t)entries;
+}
+
+/* Cleanly deallocate a list of directory files. */
+static void cleanup_sorted_dirlist(struct dlent **list, const ssize_t size) {
+    for (ssize_t i = 0; i < size; i++) {
+        free(list[i]->name);
+        free(list[i]);
+    }
+}
+
+/* Make the reply an index of a directory. */
+static void index_reply(struct connection *conn, const char *path) {
+    const char divider[] = "i\tfake\t(NULL)\t0\r\n";
+    struct apbuf *buf;
+    struct dlent **list;
+    ssize_t listsize = make_sorted_dirlist(path, &list);
+    if (listsize == -1) {
+        error_reply(conn, "Internal server error.");
+        return;
+    }
+
+    /* Heading. */
+    buf = make_apbuf();
+    append(buf, "i");
+    append(buf, conn->request_length == 0 ? "/" : conn->request);
+    append(buf, "\tfake\t(NULL)\t0\r\n");
+    append(buf, divider);
+
+    /* List of files. */
+    for (int i = 0; i < listsize; i++) {
+        /* Type. */
+        append(buf, list[i]->is_dir ? "1" : "0");
+        /* Display name. */
+        append(buf, list[i]->name);
+        append(buf, "\t");
+        /* Path. */
+        append(buf, conn->request);
+        append(buf, "/");
+        append(buf, list[i]->name);
+        append(buf, "\t");
+        /* Server. */
+        append(buf, fqdn);
+        append(buf, "\t");
+        appendf(buf, "%u\t+\r\n", port);
+    }
+    cleanup_sorted_dirlist(list, listsize);
+    free(list);
+
+    conn->reply = buf->str;
+    conn->reply_type = REPLY_GENERATED;
+    conn->reply_length = buf->length;
+    conn->state = SEND_REPLY;
+    free(buf);
 }
 
 static void process_request(struct connection *conn) {
     char *path;
-
-    /* Serving the index. */
-    if (conn->request_length == 0) {
-        /* TODO: actually generate index. */
-        conn->reply = strdup("iHello, world\tfake\t(NULL)\t0\n");
-        conn->reply_type = REPLY_GENERATED;
-        conn->reply_length = strlen(conn->reply);
-        conn->state = SEND_REPLY;
-        return;
-    }
 
     /* Serving a path: check if it's safe. */
     if (!is_request_safe(conn->request, conn->request_length)) {
@@ -254,25 +456,38 @@ static void process_request(struct connection *conn) {
         return;
     }
 
-    /* Make a path using gopher_root. */
-    path = malloc(strlen(gopher_root) + 1 + conn->request_length + 1);
-    path[0] = 0;
-    strcat(path, gopher_root);
-    strcat(path, "/");
-    strcat(path, conn->request);
+    /* Get path type. */
+    xasprintf(&path, "%s%s", gopher_root, conn->request);
+    struct stat filestat;
+    if (stat(path, &filestat) == -1) {
+        if (errno == ENOENT) {
+            error_reply(conn, "File not found.");
+        } else {
+            warn("stat(\"%s\")", path);
+            error_reply(conn, "Internal server error.");
+        }
+        free(path);
+        return;
+    }
 
-    /* Open the file. */
+    /* If it's a dir, serve an index. */
+    if (S_ISDIR(filestat.st_mode)) {
+        index_reply(conn, path);
+        free(path);
+        return;
+    }
+
+    /* Else it's a file. */
     conn->reply_fd = open(path, O_RDONLY | O_NONBLOCK);
-    free(path);
     if (conn->reply_fd == -1) {
-        conn->reply = strdup("3File not found.\terror.host\t1\n");
-        conn->reply_type = REPLY_GENERATED;
-        conn->reply_length = strlen(conn->reply);
-        conn->state = SEND_REPLY;
+        warn("open(\"%s\")", path);
+        error_reply(conn, "Internal server error.");
+        free(path);
         return;
     }
     conn->reply_type = REPLY_FROMFILE;
     conn->state = SEND_REPLY;
+    free(path);
 }
 
 /* Remove \r\n or \n suffix. */
