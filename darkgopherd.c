@@ -27,6 +27,7 @@ static const char pkgname[] = "darkgopherd/0.0.from.git",
 #include <err.h>         // err
 #include <errno.h>       // errno
 #include <fcntl.h>       // fcntl
+#include <limits.h>      // LLONG_MAX
 #include <netinet/in.h>  // sockaddr_in
 #include <signal.h>      // signal
 #include <stdarg.h>      // va_start
@@ -82,14 +83,14 @@ struct connection {
     int reply_fd;
 };
 
-static volatile int running = 0; /* Set by signal handler. */
+static volatile int running = 0; /* Set by signal handler to stop running. */
 static int listen_fd = -1;
-static uint16_t port = 7070; /* TODO: Make this configurable. */
+static uint16_t port = 7070;
 static char *fqdn = NULL;
 static struct connection **connections;
 static int num_conn = 0;
 static uint64_t num_requests = 0, total_in = 0, total_out = 0;
-static char *gopher_root = NULL; /* TODO: Make this configurable. */
+static char *gopher_root = NULL;
 
 /* close() that dies on error. */
 static void xclose(const int fd) {
@@ -186,6 +187,74 @@ static void __printflike(2, 3)
     va_end(va);
     appendl(buf, tmp, len);
     free(tmp);
+}
+
+/* Returns 1 if string is a number, 0 otherwise.  Set num to NULL if
+ * disinterested in value.
+ */
+static int str_to_num(const char *str, long long *num) {
+    char *endptr;
+    long long n;
+
+    errno = 0;
+    n = strtoll(str, &endptr, 10);
+    if (*endptr != '\0') return 0;
+    if (n == LLONG_MIN && errno == ERANGE) return 0;
+    if (n == LLONG_MAX && errno == ERANGE) return 0;
+    if (num != NULL) *num = n;
+    return 1;
+}
+
+/* Returns a valid number or dies. */
+static long long xstr_to_num(const char *str) {
+    long long ret;
+
+    if (!str_to_num(str, &ret)) {
+        errx(1, "number \"%s\" is invalid", str);
+    }
+    return ret;
+}
+
+static void usage(const char *argv0) {
+    printf("usage:\t%s /path/to/gopher_root [flags]\n\n", argv0);
+    printf(
+        "flags:\t--port number (default: %u, or 70 if running as root)\n"
+        "\t\tSpecifies which port to listen on for connections.\n"
+        "\t\tPass 0 to let the system choose a free port for you.\n\n",
+        port);
+    printf(
+        "\t--host some.domain.com (default: current hostname)\n"
+        "\t\tThe DNS name of this Gopher server.\n\n");
+}
+
+static void parse_commandline(const int argc, char *argv[]) {
+    int i;
+    size_t len;
+
+    if ((argc < 2) || (argc == 2 && strcmp(argv[1], "--help") == 0)) {
+        usage(argv[0]); /* No gopher_root given. */
+        exit(EXIT_SUCCESS);
+    }
+
+    if (getuid() == 0) port = 70;
+    gopher_root = xstrdup(argv[1]);
+
+    /* Strip ending slash. */
+    len = strlen(gopher_root);
+    if (len == 0) errx(1, "/path/to/gopher_root cannot be empty");
+    if (len > 1 && gopher_root[len - 1] == '/') gopher_root[len - 1] = '\0';
+
+    /* Walk through the remaining arguments. */
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0) {
+            if (++i >= argc) errx(1, "missing number after --port");
+            port = (uint16_t)xstr_to_num(argv[i]);
+        } else if (strcmp(argv[i], "--host") == 0) {
+            if (++i >= argc) errx(1, "missing argument after --host");
+            fqdn = xstrdup(argv[i]);
+        } else
+            errx(1, "unknown argument `%s'", argv[i]);
+    }
 }
 
 /* Signal handler for SIGTERM etc. */
@@ -664,15 +733,15 @@ int main(int argc, char **argv) {
     assert(is_request_safe("/.", 2));
     assert(!is_request_safe("/..", 3));
     assert(!is_request_safe("/../", 4));
-    gopher_root = "docs"; /* FIXME */
 
     printf("%s, %s.\n", pkgname, copyright);
+    parse_commandline(argc, argv);
+    if (fqdn == NULL) fqdn = get_fqdn();
 
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) err(1, "signal(ignore SIGPIPE)");
     if (signal(SIGINT, stop_running) == SIG_ERR) err(1, "signal(SIGINT)");
     if (signal(SIGTERM, stop_running) == SIG_ERR) err(1, "signal(SIGTERM)");
 
-    fqdn = get_fqdn();
     init_listen_fd();
     connections = xmalloc(MAX_CONNECTIONS * sizeof(*connections));
     running = 1;
